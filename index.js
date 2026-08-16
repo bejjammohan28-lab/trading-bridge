@@ -49,6 +49,10 @@ const UNDERLYINGS = {
 };
 const LOT_SIZES = { NIFTY: 75, BANKNIFTY: 30 };
 
+const MIN_PROFIT_RS = parseFloat(process.env.MIN_PROFIT_RS || "200"); // reject trades with expected profit below this
+const MAX_REENTRY_PER_STRIKE = 2; // max re-entries into the same strike per day
+const reEntryTracker = {}; // { "2026-08-16_NIFTY_24350_CE": count }
+
 const pendingTrades = {};
 
 // ============================================================
@@ -61,13 +65,55 @@ async function refreshDhanToken() {
     const totpCode = authenticator.generate(DHAN_TOTP_SECRET);
     const url = `https://auth.dhan.co/app/generateAccessToken?dhanClientId=${DHAN_CLIENT_ID}&pin=${DHAN_PIN}&totp=${totpCode}`;
     const resp = await axios.post(url);
+
+    if (!resp.data || !resp.data.accessToken) {
+      console.error("Token refresh returned no accessToken:", JSON.stringify(resp.data));
+      await sendTelegram(`⚠️ Token refresh: Dhan responded without a token.\nRaw response: ${JSON.stringify(resp.data).slice(0, 300)}`);
+      return;
+    }
+
     DHAN_ACCESS_TOKEN = resp.data.accessToken;
     console.log("Dhan token auto-refreshed. Expires:", resp.data.expiryTime);
     await sendTelegram(`🔄 Dhan token auto-refreshed. Valid until: ${resp.data.expiryTime}`);
   } catch (err) {
-    console.error("Token auto-refresh failed:", err.response?.data || err.message);
-    await sendTelegram("⚠️ Dhan token auto-refresh FAILED. Manual /token entry may be needed. Check DHAN_PIN/DHAN_TOTP_SECRET.");
+    const errData = err.response?.data || err.message;
+    console.error("Token auto-refresh failed:", JSON.stringify(errData));
+    await sendTelegram(`⚠️ Dhan token auto-refresh FAILED.\nDetails: ${JSON.stringify(errData).slice(0, 300)}`);
   }
+}
+
+// ============================================================
+// TIME / EXPIRY HELPERS (IST)
+// ============================================================
+function getISTParts() {
+  const now = new Date();
+  const istStr = now.toLocaleString("en-US", { timeZone: "Asia/Kolkata", hour12: false });
+  const istDate = new Date(istStr);
+  return {
+    dateStr: istDate.toISOString().slice(0, 10), // not perfectly IST-safe but fine for daily bucketing here
+    hour: istDate.getHours(),
+    minute: istDate.getMinutes()
+  };
+}
+
+function isWithinTradingWindow() {
+  const { hour, minute } = getISTParts();
+  const afterOpen = hour > 9 || (hour === 9 && minute >= 15);   // entries allowed from 9:15
+  const beforeCutoff = hour < 15 || (hour === 15 && minute < 15); // no new entries after 3:15
+  return afterOpen && beforeCutoff;
+}
+
+function isExpiryDay(expiryDateStr) {
+  if (!expiryDateStr) return false;
+  const { dateStr } = getISTParts();
+  return expiryDateStr === dateStr;
+}
+
+function checkReEntryLimit(symbol, strike, side) {
+  const { dateStr } = getISTParts();
+  const key = `${dateStr}_${symbol}_${strike}_${side}`;
+  const count = reEntryTracker[key] || 0;
+  return { allowed: count < MAX_REENTRY_PER_STRIKE, key, count };
 }
 
 // ============================================================
@@ -99,13 +145,13 @@ async function registerTelegramWebhook() {
 // ============================================================
 // DHAN OPTION CHAIN - real ATM strike + premium resolver
 // ============================================================
-async function getNearestExpiry(underlyingScrip) {
+async function getExpiryList(underlyingScrip) {
   const resp = await axios.post(
     "https://api.dhan.co/v2/optionchain/expirylist",
     { UnderlyingScrip: underlyingScrip, UnderlyingSeg: "IDX_I" },
     { headers: dhanHeaders() }
   );
-  return resp.data.data[0]; // nearest expiry
+  return resp.data.data; // full list, sorted nearest first
 }
 
 function dhanHeaders() {
@@ -120,7 +166,17 @@ async function getATMOption(symbol, side) {
   const under = UNDERLYINGS[symbol];
   if (!under) throw new Error("Unknown symbol: " + symbol);
 
-  const expiry = await getNearestExpiry(under.securityId);
+  const expiryList = await getExpiryList(under.securityId);
+  const { dateStr: todayIST } = getISTParts();
+
+  // THETA-DECAY RULE: if today IS the nearest expiry, skip to next week's
+  // expiry instead - avoids full theta decay / expiry-day premium collapse.
+  let expiry = expiryList[0];
+  let usedNextWeek = false;
+  if (expiry === todayIST && expiryList.length > 1) {
+    expiry = expiryList[1];
+    usedNextWeek = true;
+  }
 
   const resp = await axios.post(
     "https://api.dhan.co/v2/optionchain",
@@ -137,17 +193,16 @@ async function getATMOption(symbol, side) {
 
   const strikeData = data.oc[strikeKey];
   if (!strikeData) {
-    // fallback: find closest available strike key
     const keys = Object.keys(data.oc);
     const closest = keys.reduce((a, b) =>
       Math.abs(parseFloat(a) - spot) < Math.abs(parseFloat(b) - spot) ? a : b
     );
     const opt = data.oc[closest][side.toLowerCase()];
-    return { securityId: opt.security_id, exchangeSegment: "NSE_FNO", premium: opt.last_price, strike: closest, spot };
+    return { securityId: opt.security_id, exchangeSegment: "NSE_FNO", premium: opt.last_price, strike: closest, spot, expiry, usedNextWeek };
   }
 
-  const opt = strikeData[side.toLowerCase()]; // "ce" or "pe"
-  return { securityId: opt.security_id, exchangeSegment: "NSE_FNO", premium: opt.last_price, strike: atmStrike, spot };
+  const opt = strikeData[side.toLowerCase()];
+  return { securityId: opt.security_id, exchangeSegment: "NSE_FNO", premium: opt.last_price, strike: atmStrike, spot, expiry, usedNextWeek };
 }
 
 // ============================================================
@@ -211,9 +266,16 @@ async function placeSuperOrder({ securityId, exchangeSegment, quantity, entryPri
 async function processSignal(signal) {
   const { symbol, side, confidence } = signal;
 
+  // RULE 1: Market timing window (no entries before 9:45, none after 3:15)
+  if (!isWithinTradingWindow()) {
+    console.log("Outside trading window (9:45-3:15) - skipping");
+    return { skipped: true, reason: "outside trading window" };
+  }
+
+  // RULE 2: Sideways / low confidence filter (matches Pine Script threshold)
   if (confidence !== undefined && confidence < MIN_CONFIDENCE) {
     console.log(`Confidence ${confidence}% below threshold ${MIN_CONFIDENCE}% - skipping`);
-    return { skipped: true, reason: "low confidence" };
+    return { skipped: true, reason: "low confidence / sideways" };
   }
 
   let atm;
@@ -225,21 +287,48 @@ async function processSignal(signal) {
     return { error: "option chain fetch failed" };
   }
 
-  const { securityId, exchangeSegment, premium, strike, spot } = atm;
+  const { securityId, exchangeSegment, premium, strike, spot, expiry, usedNextWeek } = atm;
+
+  // RULE 3: Same-strike re-entry limit (max 2 per day)
+  const reentry = checkReEntryLimit(symbol, strike, side);
+  if (!reentry.allowed) {
+    await sendTelegram(`⚠️ ${symbol} ${side} strike ${strike} ఇప్పటికే ${reentry.count} సార్లు ఈ రోజు enter అయ్యింది (max ${MAX_REENTRY_PER_STRIKE}). Skip చేస్తున్నాను.`);
+    return { skipped: true, reason: "re-entry limit reached", strike, count: reentry.count };
+  }
+
+  // RULE 4: Expiry-day size reduction (50%). Note: usedNextWeek=true means today
+  // WAS expiry day and we already shifted to next week's chain to avoid theta decay -
+  // still reduce size since today's overall market behavior stays volatile.
+  const expiryDayToday = usedNextWeek;
+  const effectiveBudget = expiryDayToday ? TRADE_BUDGET * 0.5 : TRADE_BUDGET;
+
   const lotSize = LOT_SIZES[symbol] || 75;
-  const { quantity, lots, estimatedCost } = calculateQuantity(TRADE_BUDGET, premium, lotSize);
+  const { quantity, lots, estimatedCost } = calculateQuantity(effectiveBudget, premium, lotSize);
 
   if (quantity === 0) {
     await sendTelegram(
       `⚠️ Signal: ${symbol} ${side} @ strike ${strike} (premium ₹${premium})\n` +
-      `Budget ₹${TRADE_BUDGET} 1 lot (${lotSize} qty) కి కూడా సరిపోలేదు.\n` +
+      `Budget ₹${effectiveBudget}${expiryDayToday ? " (expiry day, 50% reduced)" : ""} 1 lot (${lotSize} qty) కి కూడా సరిపోలేదు.\n` +
       `Budget పెంచడానికి: /budget <amount> Telegram కి పంపు.`
     );
     return { skipped: true, reason: "budget too small", premium, lotSize };
   }
 
   const plan = buildTradePlan(premium);
-  const tradeDetails = { symbol, side, securityId, exchangeSegment, quantity, lots, estimatedCost, strike, spot, ...plan };
+
+  // RULE 5: Minimum profit filter (target profit must exceed ₹100)
+  const expectedProfit = (plan.targetPrice - plan.entryPrice) * quantity;
+  if (expectedProfit < MIN_PROFIT_RS) {
+    await sendTelegram(
+      `⚠️ Signal: ${symbol} ${side} @ strike ${strike} skip చేశాను — expected profit ₹${expectedProfit.toFixed(0)} ` +
+      `(minimum ₹${MIN_PROFIT_RS} కావాలి). చిన్న premium/budget వల్ల ఇది జరిగింది.`
+    );
+    return { skipped: true, reason: "profit below minimum", expectedProfit };
+  }
+
+  reEntryTracker[reentry.key] = reentry.count + 1;
+
+  const tradeDetails = { symbol, side, securityId, exchangeSegment, quantity, lots, estimatedCost, strike, spot, expectedProfit, expiryDayToday, ...plan };
 
   if (AUTO_MODE) {
     const result = await placeSuperOrder(tradeDetails);
@@ -258,7 +347,9 @@ async function processSignal(signal) {
       `📋 <b>Trade Plan Ready</b>\n${symbol} ${side} | Strike: ${strike} | Spot: ${spot}\n` +
       `Lots: ${lots} | Qty: ${quantity} | Premium: ₹${premium}\n` +
       `Entry: ${plan.entryPrice} | Target: ${plan.targetPrice} | SL: ${plan.slPrice}\n` +
-      `Estimated Cost: ~₹${estimatedCost}\n\n` +
+      `Estimated Cost: ~₹${estimatedCost} | Expected Profit: ₹${expectedProfit.toFixed(0)}\n` +
+      `${expiryDayToday ? "📅 EXPIRY DAY — next week's expiry (" + expiry + ") వాడాను theta decay avoid చేయడానికి, size 50% reduced\n" : ""}` +
+      `Re-entry count today: ${reentry.count + 1}/${MAX_REENTRY_PER_STRIKE}\n\n` +
       `వీలున్నప్పుడు execute చేయడానికి:\n${baseUrl}/approve/${token}\n\n` +
       `(ఈ link 30 నిమిషాలు valid)`
     );
@@ -278,7 +369,14 @@ app.get('/', (req, res) => res.send(
 
 app.post('/webhook', async (req, res) => {
   console.log("Webhook received:", req.body);
-  const result = await processSignal(req.body);
+  // Maps Mohan_Signal_Pro_v1.pine alert JSON: {"signal":"CE","symbol":"NIFTY",...,"confidence":80}
+  const body = req.body;
+  const side = body.side || body.signal; // "CE" or "PE"
+  let symbol = body.symbol || "NIFTY";
+  symbol = symbol.toUpperCase().includes("BANKNIFTY") ? "BANKNIFTY" : "NIFTY";
+  const confidence = parseFloat(body.confidence || 0);
+
+  const result = await processSignal({ symbol, side, confidence });
   res.json(result);
 });
 
