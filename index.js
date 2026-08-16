@@ -1,11 +1,15 @@
 // index.js
-// Mohan's Combined Trading Bridge
-// Flow: TradingView Pine alert -> webhook -> budget-based trade plan -> Telegram message
+// Mohan's Combined Trading Bridge — v2
+// Flow: TradingView Pine alert -> webhook -> real ATM strike/premium (Dhan Option Chain)
+//       -> budget-based trade plan -> Telegram message
 //       -> manual tap-to-approve link (default) OR auto-execute (if AUTO_MODE=true)
 //       -> Dhan Super Order (entry + trailing target + trailing SL)
 //
+// NEW in v2:
+//   - Real Dhan Option Chain integration (no more placeholder premium)
+//   - Telegram command: send "/budget 15000" to your bot to update budget instantly
+//
 // SAFETY DEFAULTS: DRY_RUN=true, AUTO_MODE=false
-// Change only after you've watched signals for a while and trust them.
 
 const express = require('express');
 const axios = require('axios');
@@ -22,29 +26,100 @@ const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID   || "642914274";
 const DHAN_ACCESS_TOKEN  = process.env.DHAN_ACCESS_TOKEN  || "PASTE_YOUR_DHAN_TOKEN";
 const DHAN_CLIENT_ID     = process.env.DHAN_CLIENT_ID     || "PASTE_YOUR_CLIENT_ID";
 
-const DRY_RUN   = process.env.DRY_RUN !== "false";   // default TRUE - no real orders
-// AUTO_MODE is now a runtime toggle (not just env var) - flip it anytime via /mode/on or /mode/off
-let AUTO_MODE = process.env.AUTO_MODE === "true";  // default FALSE - manual approval required
+const DRY_RUN   = process.env.DRY_RUN !== "false";
+let AUTO_MODE   = process.env.AUTO_MODE === "true";
+let TRADE_BUDGET = parseFloat(process.env.TRADE_BUDGET || "5000"); // now mutable at runtime
+const MIN_CONFIDENCE = parseFloat(process.env.MIN_CONFIDENCE || "70");
 
-const TRADE_BUDGET = parseFloat(process.env.TRADE_BUDGET || "5000"); // per-trade budget in Rs
-const MIN_CONFIDENCE = parseFloat(process.env.MIN_CONFIDENCE || "70"); // matches Pine Script threshold
+// PUBLIC_URL needed to auto-register the Telegram webhook on startup
+const PUBLIC_URL = process.env.PUBLIC_URL || "";
 
-const NIFTY_LOT_SIZE = 75;
-const BANKNIFTY_LOT_SIZE = 30;
+const UNDERLYINGS = {
+  NIFTY:      { securityId: 13, strikeStep: 50 },
+  BANKNIFTY:  { securityId: 25, strikeStep: 100 }
+};
+const LOT_SIZES = { NIFTY: 75, BANKNIFTY: 30 };
 
-// Pending trades waiting for manual approval, keyed by a short token
 const pendingTrades = {};
 
 // ============================================================
-// TELEGRAM SEND
+// TELEGRAM
 // ============================================================
-async function sendTelegram(message, extra = {}) {
+async function sendTelegram(message) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
   try {
-    await axios.post(url, { chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: "HTML", ...extra });
+    await axios.post(url, { chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: "HTML" });
   } catch (err) {
     console.error("Telegram send failed:", err.response?.data || err.message);
   }
+}
+
+async function registerTelegramWebhook() {
+  if (!PUBLIC_URL) {
+    console.log("PUBLIC_URL not set - skipping Telegram webhook auto-registration. Set it in Railway variables after first deploy, then redeploy.");
+    return;
+  }
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook`;
+    await axios.post(url, { url: `${PUBLIC_URL}/telegram-webhook` });
+    console.log("Telegram webhook registered at " + PUBLIC_URL + "/telegram-webhook");
+  } catch (err) {
+    console.error("Telegram webhook registration failed:", err.response?.data || err.message);
+  }
+}
+
+// ============================================================
+// DHAN OPTION CHAIN - real ATM strike + premium resolver
+// ============================================================
+async function getNearestExpiry(underlyingScrip) {
+  const resp = await axios.post(
+    "https://api.dhan.co/v2/optionchain/expirylist",
+    { UnderlyingScrip: underlyingScrip, UnderlyingSeg: "IDX_I" },
+    { headers: dhanHeaders() }
+  );
+  return resp.data.data[0]; // nearest expiry
+}
+
+function dhanHeaders() {
+  return {
+    "access-token": DHAN_ACCESS_TOKEN,
+    "client-id": DHAN_CLIENT_ID,
+    "Content-Type": "application/json"
+  };
+}
+
+async function getATMOption(symbol, side) {
+  const under = UNDERLYINGS[symbol];
+  if (!under) throw new Error("Unknown symbol: " + symbol);
+
+  const expiry = await getNearestExpiry(under.securityId);
+
+  const resp = await axios.post(
+    "https://api.dhan.co/v2/optionchain",
+    { UnderlyingScrip: under.securityId, UnderlyingSeg: "IDX_I", Expiry: expiry },
+    { headers: dhanHeaders() }
+  );
+
+  const data = resp.data.data;
+  const spot = data.last_price;
+
+  // Round spot to nearest strike step to find ATM
+  const atmStrike = Math.round(spot / under.strikeStep) * under.strikeStep;
+  const strikeKey = atmStrike.toFixed(6); // API keys look like "25650.000000"
+
+  const strikeData = data.oc[strikeKey];
+  if (!strikeData) {
+    // fallback: find closest available strike key
+    const keys = Object.keys(data.oc);
+    const closest = keys.reduce((a, b) =>
+      Math.abs(parseFloat(a) - spot) < Math.abs(parseFloat(b) - spot) ? a : b
+    );
+    const opt = data.oc[closest][side.toLowerCase()];
+    return { securityId: opt.security_id, exchangeSegment: "NSE_FNO", premium: opt.last_price, strike: closest, spot };
+  }
+
+  const opt = strikeData[side.toLowerCase()]; // "ce" or "pe"
+  return { securityId: opt.security_id, exchangeSegment: "NSE_FNO", premium: opt.last_price, strike: atmStrike, spot };
 }
 
 // ============================================================
@@ -59,7 +134,7 @@ function calculateQuantity(budget, premium, lotSize) {
 }
 
 // ============================================================
-// TRADE PLAN (R:R >= 1:1.5, matches your existing rule)
+// TRADE PLAN
 // ============================================================
 function buildTradePlan(premium, targetRRMultiplier = 1.5, slPct = 0.20, trailJumpPct = 0.05) {
   const slPrice = +(premium * (1 - slPct)).toFixed(2);
@@ -94,13 +169,7 @@ async function placeSuperOrder({ securityId, exchangeSegment, quantity, entryPri
   }
 
   try {
-    const resp = await axios.post("https://api.dhan.co/v2/super/orders", payload, {
-      headers: {
-        "access-token": DHAN_ACCESS_TOKEN,
-        "client-id": DHAN_CLIENT_ID,
-        "Content-Type": "application/json"
-      }
-    });
+    const resp = await axios.post("https://api.dhan.co/v2/super/orders", payload, { headers: dhanHeaders() });
     return resp.data;
   } catch (err) {
     console.error("Super Order failed:", err.response?.data || err.message);
@@ -109,59 +178,62 @@ async function placeSuperOrder({ securityId, exchangeSegment, quantity, entryPri
 }
 
 // ============================================================
-// PREMIUM FETCH - plug your existing ATM strike resolver + LTP fetch here
-// ============================================================
-async function getOptionPremiumAndSecurityId(symbol, side) {
-  // TODO: replace with your existing option-chain resolver from your bridge repo.
-  // Must return { securityId, exchangeSegment, premium }
-  console.log(`[placeholder] resolving ATM ${side} strike for ${symbol}`);
-  return { securityId: "00000", exchangeSegment: "NSE_FNO", premium: 100 };
-}
-
-// ============================================================
-// CORE: process a signal (from webhook or manual test)
+// CORE: process a trading signal
 // ============================================================
 async function processSignal(signal) {
-  const { symbol, side, confidence } = signal; // side: "CE" or "PE"
+  const { symbol, side, confidence } = signal;
 
   if (confidence !== undefined && confidence < MIN_CONFIDENCE) {
     console.log(`Confidence ${confidence}% below threshold ${MIN_CONFIDENCE}% - skipping`);
     return { skipped: true, reason: "low confidence" };
   }
 
-  const { securityId, exchangeSegment, premium } = await getOptionPremiumAndSecurityId(symbol, side);
-  const lotSize = symbol === "BANKNIFTY" ? BANKNIFTY_LOT_SIZE : NIFTY_LOT_SIZE;
+  let atm;
+  try {
+    atm = await getATMOption(symbol, side);
+  } catch (err) {
+    console.error("ATM resolution failed:", err.response?.data || err.message);
+    await sendTelegram(`⚠️ Signal వచ్చింది (${symbol} ${side}) కానీ option chain fetch fail అయ్యింది. Dhan token/client-id check చేయు.`);
+    return { error: "option chain fetch failed" };
+  }
+
+  const { securityId, exchangeSegment, premium, strike, spot } = atm;
+  const lotSize = LOT_SIZES[symbol] || 75;
   const { quantity, lots, estimatedCost } = calculateQuantity(TRADE_BUDGET, premium, lotSize);
 
   if (quantity === 0) {
-    await sendTelegram(`⚠️ Signal came (${symbol} ${side}) but budget ₹${TRADE_BUDGET} is too small for 1 lot at premium ₹${premium}.`);
-    return { skipped: true, reason: "budget too small" };
+    await sendTelegram(
+      `⚠️ Signal: ${symbol} ${side} @ strike ${strike} (premium ₹${premium})\n` +
+      `Budget ₹${TRADE_BUDGET} 1 lot (${lotSize} qty) కి కూడా సరిపోలేదు.\n` +
+      `Budget పెంచడానికి: /budget <amount> Telegram కి పంపు.`
+    );
+    return { skipped: true, reason: "budget too small", premium, lotSize };
   }
 
   const plan = buildTradePlan(premium);
-  const tradeDetails = { symbol, side, securityId, exchangeSegment, quantity, lots, estimatedCost, ...plan };
+  const tradeDetails = { symbol, side, securityId, exchangeSegment, quantity, lots, estimatedCost, strike, spot, ...plan };
 
   if (AUTO_MODE) {
     const result = await placeSuperOrder(tradeDetails);
     await sendTelegram(
-      `🤖 <b>AUTO-EXECUTED</b>\n${symbol} ${side} | Lots: ${lots} | Qty: ${quantity}\n` +
+      `🤖 <b>AUTO-EXECUTED</b>\n${symbol} ${side} | Strike: ${strike} | Spot: ${spot}\n` +
+      `Lots: ${lots} | Qty: ${quantity} | Premium: ₹${premium}\n` +
       `Entry: ${plan.entryPrice} | Target: ${plan.targetPrice} | SL: ${plan.slPrice}\n` +
       `Cost: ~₹${estimatedCost}\n${DRY_RUN ? "(DRY RUN - no real order placed)" : "LIVE ORDER PLACED"}`
     );
     return { executed: true, dryRun: DRY_RUN, result };
   } else {
-    // Manual mode: store pending trade, send approval link
     const token = "t_" + Date.now();
     pendingTrades[token] = tradeDetails;
-    const baseUrl = process.env.PUBLIC_URL || "http://localhost:3000";
+    const baseUrl = PUBLIC_URL || "http://localhost:3000";
     await sendTelegram(
-      `📋 <b>Trade Plan Ready</b>\n${symbol} ${side} | Lots: ${lots} | Qty: ${quantity}\n` +
+      `📋 <b>Trade Plan Ready</b>\n${symbol} ${side} | Strike: ${strike} | Spot: ${spot}\n` +
+      `Lots: ${lots} | Qty: ${quantity} | Premium: ₹${premium}\n` +
       `Entry: ${plan.entryPrice} | Target: ${plan.targetPrice} | SL: ${plan.slPrice}\n` +
       `Estimated Cost: ~₹${estimatedCost}\n\n` +
       `వీలున్నప్పుడు execute చేయడానికి:\n${baseUrl}/approve/${token}\n\n` +
-      `(ఈ link 30 నిమిషాలు valid, market conditions మారితే expire చేసుకో)`
+      `(ఈ link 30 నిమిషాలు valid)`
     );
-    // auto-expire after 30 min
     setTimeout(() => delete pendingTrades[token], 30 * 60 * 1000);
     return { pending: true, token };
   }
@@ -171,38 +243,17 @@ async function processSignal(signal) {
 // ROUTES
 // ============================================================
 app.get('/', (req, res) => res.send(
-  "Mohan Trading Bridge running.\n" +
-  "Mode: " + (AUTO_MODE ? "AUTO" : "MANUAL") + " | DRY_RUN: " + DRY_RUN + "\n\n" +
-  "Toggle: /mode/on (auto) | /mode/off (manual)"
+  "Mohan Trading Bridge v2 running.\n" +
+  "Mode: " + (AUTO_MODE ? "AUTO" : "MANUAL") + " | DRY_RUN: " + DRY_RUN + " | Budget: ₹" + TRADE_BUDGET + "\n\n" +
+  "Toggle: /mode/on | /mode/off\nBudget: send /budget <amount> to Telegram bot"
 ));
 
-// ============================================================
-// RUNTIME TOGGLE - tap these URLs anytime, no redeploy needed
-// ============================================================
-app.get('/mode/on', async (req, res) => {
-  AUTO_MODE = true;
-  await sendTelegram("🤖 Mode switched to AUTO — signals ఇక direct గా execute అవుతాయి (DRY_RUN=" + DRY_RUN + ").");
-  res.send("AUTO mode ON. Signals will now execute automatically" + (DRY_RUN ? " (dry run only)." : "."));
-});
-
-app.get('/mode/off', async (req, res) => {
-  AUTO_MODE = false;
-  await sendTelegram("✋ Mode switched to MANUAL — signals ఇక Telegram కి plan పంపుతాయి, నువ్వు approve చేయాలి.");
-  res.send("MANUAL mode ON. You'll get a Telegram plan with an approve link for each signal.");
-});
-
-app.get('/mode/status', (req, res) => {
-  res.json({ autoMode: AUTO_MODE, dryRun: DRY_RUN, budget: TRADE_BUDGET, minConfidence: MIN_CONFIDENCE });
-});
-
-// TradingView Pine Script webhook lands here
 app.post('/webhook', async (req, res) => {
   console.log("Webhook received:", req.body);
   const result = await processSignal(req.body);
   res.json(result);
 });
 
-// Manual test trigger (no need to wait for TradingView)
 app.get('/test-signal', async (req, res) => {
   const symbol = req.query.symbol || "NIFTY";
   const side = req.query.side || "CE";
@@ -211,12 +262,9 @@ app.get('/test-signal', async (req, res) => {
   res.json(result);
 });
 
-// Tap this link from Telegram to actually execute a pending manual trade
 app.get('/approve/:token', async (req, res) => {
   const trade = pendingTrades[req.params.token];
-  if (!trade) {
-    return res.send("Link expired or already used. Signal ఇక valid కాదు, కొత్త signal కోసం wait చేయు.");
-  }
+  if (!trade) return res.send("Link expired or already used.");
   delete pendingTrades[req.params.token];
   const result = await placeSuperOrder(trade);
   await sendTelegram(
@@ -226,8 +274,58 @@ app.get('/approve/:token', async (req, res) => {
   res.send(`Order ${DRY_RUN ? "(dry run) processed" : "placed"}. Telegram లో confirm చూడు.`);
 });
 
+app.get('/mode/on', async (req, res) => {
+  AUTO_MODE = true;
+  await sendTelegram("🤖 Mode: AUTO — signals ఇక direct గా execute అవుతాయి (DRY_RUN=" + DRY_RUN + ").");
+  res.send("AUTO mode ON.");
+});
+
+app.get('/mode/off', async (req, res) => {
+  AUTO_MODE = false;
+  await sendTelegram("✋ Mode: MANUAL — ప్రతి signal కి approve link వస్తుంది.");
+  res.send("MANUAL mode ON.");
+});
+
+app.get('/mode/status', (req, res) => {
+  res.json({ autoMode: AUTO_MODE, dryRun: DRY_RUN, budget: TRADE_BUDGET, minConfidence: MIN_CONFIDENCE });
+});
+
+// ============================================================
+// TELEGRAM WEBHOOK - handles "/budget <amount>" sent to the bot
+// ============================================================
+app.post('/telegram-webhook', async (req, res) => {
+  const msg = req.body.message;
+  if (!msg || !msg.text) return res.sendStatus(200);
+
+  const text = msg.text.trim();
+
+  if (text.startsWith("/budget")) {
+    const parts = text.split(" ");
+    const amount = parseFloat(parts[1]);
+    if (!isNaN(amount) && amount > 0) {
+      TRADE_BUDGET = amount;
+      await sendTelegram(`✅ Budget updated: ₹${TRADE_BUDGET}. తర్వాతి signal నుండి ఇదే వాడుతుంది.`);
+    } else {
+      await sendTelegram("Format: /budget 15000 (ఒక్క number మాత్రమే)");
+    }
+  } else if (text === "/status") {
+    await sendTelegram(
+      `Mode: ${AUTO_MODE ? "AUTO" : "MANUAL"}\nDRY_RUN: ${DRY_RUN}\nBudget: ₹${TRADE_BUDGET}\nMin Confidence: ${MIN_CONFIDENCE}%`
+    );
+  } else if (text === "/auto") {
+    AUTO_MODE = true;
+    await sendTelegram("🤖 Mode: AUTO");
+  } else if (text === "/manual") {
+    AUTO_MODE = false;
+    await sendTelegram("✋ Mode: MANUAL");
+  }
+
+  res.sendStatus(200);
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Trading bridge running on port ${PORT}`);
-  console.log(`Mode: ${AUTO_MODE ? "AUTO" : "MANUAL (approval required)"} | DRY_RUN: ${DRY_RUN} | Budget: ₹${TRADE_BUDGET}`);
+  console.log(`Trading bridge v2 running on port ${PORT}`);
+  console.log(`Mode: ${AUTO_MODE ? "AUTO" : "MANUAL"} | DRY_RUN: ${DRY_RUN} | Budget: ₹${TRADE_BUDGET}`);
+  registerTelegramWebhook();
 });
