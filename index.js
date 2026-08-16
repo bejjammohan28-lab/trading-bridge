@@ -13,6 +13,7 @@
 
 const express = require('express');
 const axios = require('axios');
+const { authenticator } = require('otplib');
 
 const app = express();
 app.use(express.json());
@@ -23,8 +24,16 @@ app.use(express.json());
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "8767819996:AAGeDsP-aOlLra_2yk_ny7fGZEcWWO5YGQU";
 const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID   || "642914274";
 
-const DHAN_ACCESS_TOKEN  = process.env.DHAN_ACCESS_TOKEN  || "PASTE_YOUR_DHAN_TOKEN";
-const DHAN_CLIENT_ID     = process.env.DHAN_CLIENT_ID     || "PASTE_YOUR_CLIENT_ID";
+// Dhan token expires every 24 hours (Dhan's current policy) - update it daily via Telegram: /token <newtoken>
+// OR set up full auto-refresh below using DHAN_PIN + DHAN_TOTP_SECRET (see setupAutoRefresh)
+let DHAN_ACCESS_TOKEN  = process.env.DHAN_ACCESS_TOKEN  || "PASTE_YOUR_DHAN_TOKEN";
+let DHAN_CLIENT_ID     = process.env.DHAN_CLIENT_ID     || "PASTE_YOUR_CLIENT_ID";
+
+// For fully automatic token refresh (optional). Set these as Railway Variables ONLY -
+// never commit them to GitHub. Leave blank to use manual /token mode instead.
+const DHAN_PIN          = process.env.DHAN_PIN          || "";  // 6-digit Dhan trading PIN
+const DHAN_TOTP_SECRET  = process.env.DHAN_TOTP_SECRET  || "";  // base32 secret from Dhan TOTP setup
+const AUTO_REFRESH_TOKEN = !!(DHAN_PIN && DHAN_TOTP_SECRET);
 
 const DRY_RUN   = process.env.DRY_RUN !== "false";
 let AUTO_MODE   = process.env.AUTO_MODE === "true";
@@ -41,6 +50,25 @@ const UNDERLYINGS = {
 const LOT_SIZES = { NIFTY: 75, BANKNIFTY: 30 };
 
 const pendingTrades = {};
+
+// ============================================================
+// AUTO TOKEN REFRESH (using API Key flow: PIN + TOTP)
+// ============================================================
+async function refreshDhanToken() {
+  if (!AUTO_REFRESH_TOKEN) return; // manual /token mode - skip
+
+  try {
+    const totpCode = authenticator.generate(DHAN_TOTP_SECRET);
+    const url = `https://auth.dhan.co/app/generateAccessToken?dhanClientId=${DHAN_CLIENT_ID}&pin=${DHAN_PIN}&totp=${totpCode}`;
+    const resp = await axios.post(url);
+    DHAN_ACCESS_TOKEN = resp.data.accessToken;
+    console.log("Dhan token auto-refreshed. Expires:", resp.data.expiryTime);
+    await sendTelegram(`🔄 Dhan token auto-refreshed. Valid until: ${resp.data.expiryTime}`);
+  } catch (err) {
+    console.error("Token auto-refresh failed:", err.response?.data || err.message);
+    await sendTelegram("⚠️ Dhan token auto-refresh FAILED. Manual /token entry may be needed. Check DHAN_PIN/DHAN_TOTP_SECRET.");
+  }
+}
 
 // ============================================================
 // TELEGRAM
@@ -287,7 +315,12 @@ app.get('/mode/off', async (req, res) => {
 });
 
 app.get('/mode/status', (req, res) => {
-  res.json({ autoMode: AUTO_MODE, dryRun: DRY_RUN, budget: TRADE_BUDGET, minConfidence: MIN_CONFIDENCE });
+  res.json({ autoMode: AUTO_MODE, dryRun: DRY_RUN, budget: TRADE_BUDGET, minConfidence: MIN_CONFIDENCE, tokenRefresh: AUTO_REFRESH_TOKEN ? "auto" : "manual" });
+});
+
+app.get('/refresh-token', async (req, res) => {
+  await refreshDhanToken();
+  res.send("Refresh attempted. Check Telegram for confirmation.");
 });
 
 // ============================================================
@@ -310,7 +343,7 @@ app.post('/telegram-webhook', async (req, res) => {
     }
   } else if (text === "/status") {
     await sendTelegram(
-      `Mode: ${AUTO_MODE ? "AUTO" : "MANUAL"}\nDRY_RUN: ${DRY_RUN}\nBudget: ₹${TRADE_BUDGET}\nMin Confidence: ${MIN_CONFIDENCE}%`
+      `Mode: ${AUTO_MODE ? "AUTO" : "MANUAL"}\nDRY_RUN: ${DRY_RUN}\nBudget: ₹${TRADE_BUDGET}\nMin Confidence: ${MIN_CONFIDENCE}%\nToken Refresh: ${AUTO_REFRESH_TOKEN ? "AUTOMATIC" : "MANUAL"}`
     );
   } else if (text === "/auto") {
     AUTO_MODE = true;
@@ -318,6 +351,24 @@ app.post('/telegram-webhook', async (req, res) => {
   } else if (text === "/manual") {
     AUTO_MODE = false;
     await sendTelegram("✋ Mode: MANUAL");
+  } else if (text.startsWith("/token")) {
+    const parts = text.split(" ");
+    const newToken = parts[1];
+    if (newToken && newToken.length > 20) {
+      DHAN_ACCESS_TOKEN = newToken.trim();
+      await sendTelegram("✅ Dhan token updated. ఇక ఇదే వాడుతుంది (24 గంటలు valid, రేపు మళ్ళీ update చేయాలి).");
+    } else {
+      await sendTelegram("Format: /token <paste_your_dhan_access_token_here>\n(Dhan web app లో రోజూ కొత్తగా generate చేసి, ఇక్కడ paste చేయు)");
+    }
+  } else if (text.startsWith("/clientid")) {
+    const parts = text.split(" ");
+    const newId = parts[1];
+    if (newId) {
+      DHAN_CLIENT_ID = newId.trim();
+      await sendTelegram("✅ Dhan Client ID updated.");
+    } else {
+      await sendTelegram("Format: /clientid <your_dhan_client_id>");
+    }
   }
 
   res.sendStatus(200);
@@ -327,5 +378,11 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Trading bridge v2 running on port ${PORT}`);
   console.log(`Mode: ${AUTO_MODE ? "AUTO" : "MANUAL"} | DRY_RUN: ${DRY_RUN} | Budget: ₹${TRADE_BUDGET}`);
+  console.log(`Token refresh: ${AUTO_REFRESH_TOKEN ? "AUTOMATIC (PIN+TOTP)" : "MANUAL (/token command)"}`);
   registerTelegramWebhook();
+
+  if (AUTO_REFRESH_TOKEN) {
+    refreshDhanToken(); // refresh once on startup
+    setInterval(refreshDhanToken, 20 * 60 * 60 * 1000); // then every 20 hours (token valid 24h)
+  }
 });
